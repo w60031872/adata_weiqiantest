@@ -10,6 +10,8 @@
 
 import threading
 import time
+from collections import defaultdict
+from urllib.parse import urlparse
 
 import requests
 
@@ -41,6 +43,64 @@ class SunProxy(object):
             del cls._data[key]
 
 
+class DomainRateLimiter:
+    _instance = None
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self._requests = defaultdict(list)
+        self._limits = defaultdict(lambda: {'max_requests': 30, 'window': 60})
+        self._limiter_lock = threading.Lock()
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    def set_limit(self, domain: str, max_requests: int = 30, window: int = 60):
+        with self._limiter_lock:
+            self._limits[domain]['max_requests'] = max_requests
+            self._limits[domain]['window'] = window
+
+    def get_limit(self, domain: str) -> dict:
+        return dict(self._limits.get(domain, {'max_requests': 30, 'window': 60}))
+
+    def _get_domain(self, url: str) -> str:
+        parsed = urlparse(url)
+        return parsed.netloc or ''
+
+    def acquire(self, url: str) -> bool:
+        if not url:
+            return True
+        domain = self._get_domain(url)
+        if not domain:
+            return True
+
+        with self._limiter_lock:
+            limit = self._limits.get(domain, {'max_requests': 30, 'window': 60})
+            max_requests = limit['max_requests']
+            window = limit['window']
+
+            now = time.time()
+            self._requests[domain] = [t for t in self._requests[domain] if now - t < window]
+
+            if len(self._requests[domain]) >= max_requests:
+                sleep_time = self._requests[domain][0] + window - now
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                    now = time.time()
+                    self._requests[domain] = [t for t in self._requests[domain] if now - t < window]
+
+            self._requests[domain].append(now)
+            return True
+
+
+rate_limiter = DomainRateLimiter.get_instance()
+
+
 class SunRequests(object):
     def __init__(self, sun_proxy: SunProxy = None) -> None:
         super().__init__()
@@ -58,7 +118,7 @@ class SunRequests(object):
         :param kwargs: 其它 requests 参数，用法相同
         :return: res
         """
-        # 1. 获取设置代理
+        rate_limiter.acquire(url)
         proxies = self.__get_proxies(proxies)
         # 2. 请求数据结果
         res = None
